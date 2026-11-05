@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.flet/
+build/
+dist/
+*.apk
+*.aab
+*.exe
+*.spec
+.vscode/
