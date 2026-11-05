@@ -5,6 +5,7 @@ import threading
 import flet as ft
 import yadisk_core as core
 
+APP_VERSION = "1.0.0"
 WORKER_CHOICES = [1, 2, 3, 4, 5, 6, 8]
 DEFAULT_WORKERS = 3
 REFRESH = 0.3  # период обновления UI, сек
@@ -60,7 +61,7 @@ def fmt_mb(b):
 
 
 def main(page: ft.Page):
-    page.title = "Yandex Disk Downloader"
+    page.title = f"Yandex Disk downloader v{APP_VERSION}"
     page.padding = 16
 
     url = ft.TextField(label="Публичная ссылка")

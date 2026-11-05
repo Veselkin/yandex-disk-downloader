@@ -1,5 +1,5 @@
 [project]
-name = "YandexDiskDownloader"
+name = "yandex-disk-downloader"
 version = "1.0.0"
 description = ""
 readme = "README.md"
@@ -28,7 +28,7 @@ pythonpath = ["src"]
 
 [tool.flet]
 org = "ru.veselkin"
-product = "Yandex Disk Downloader"
+product = "Yandex Disk downloader"
 company = "Veselkin"
 copyright = "Copyright (c) 2026 Veselkin"
 icon = "src/assets/icon.png"
