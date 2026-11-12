@@ -17,7 +17,7 @@ import random
 import hashlib
 
 API = "https://cloud-api.yandex.net/v1/disk/public/resources"
-CACHE_TTL = 3600  # Время жизни кэша в секундах (1 час)
+CACHE_TTL = 86400  # Время жизни кэша в секундах (24 часа)
 
 
 def get_cache_filename(public_key):
