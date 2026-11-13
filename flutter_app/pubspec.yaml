@@ -1,0 +1,36 @@
+name: yandex_disk_downloader
+description: Yandex Disk downloader
+publish_to: none
+version: 1.2.0+3
+
+environment:
+  sdk: ^3.13.7
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  file_picker: ^13.3.2
+  flutter_foreground_task: ^10.0.0
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  permission_handler: ^13.0.2
+  shared_preferences: ^2.5.6
+  crypto: ^3.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+
+flutter_launcher_icons:
+  image_path: "assets/icon/icon.png"
+  android: true
+  ios: false
+  windows:
+    generate: true
+    image_path: "assets/icon/icon.png"
