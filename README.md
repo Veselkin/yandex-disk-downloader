@@ -133,7 +133,7 @@ python yadisk_downloader.py <ссылка> "C:\MyFiles"
 **Проверка контрольной суммы.** Рядом с файлами лежат файлы контрольных сумм (`.sha256` или `.sha1`), а GitHub показывает SHA-256 каждого файла в списке Assets. Проверка в Windows:
 
 ```text
-certutil -hashfile yandex-disk-downloader-<версия>.exe SHA256
+certutil -hashfile yandex-disk-downloader-<версия>.exe SHA1
 ```
 
 ---
