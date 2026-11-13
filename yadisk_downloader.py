@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Скачивание публичной папки или одиночного файла с Яндекс Диска без авторизации 
-(с пагинацией, кэшированием статусов gone, проверкой MD5 и защитой от 429/500).
+Скачивание публичной папки или одиночного файла с Яндекс Диска без авторизации
+(с пагинацией, кэшированием статусов gone, проверкой размера и MD5, журналом проблем
+и защитой от 429/500).
 Использование: python yadisk_download.py <ссылка> [папка назначения]
 """
 
@@ -11,6 +12,8 @@ import json
 import urllib.request
 import urllib.parse
 import urllib.error
+import http.client
+import ssl
 import socket
 import time
 import random
@@ -20,6 +23,22 @@ API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 CACHE_TTL = 86400  # Время жизни кэша в секундах (24 часа)
 
 unavailable_log = time.strftime("unavailable_files_%Y-%m-%d_%H-%M-%S.txt")
+
+
+class RetryableError(Exception):
+    """Проверка после скачивания не прошла: имеет смысл повторить."""
+
+
+# Ошибки, при которых скачивание нужно повторять
+RETRY_ERRORS = (
+    TimeoutError,
+    socket.timeout,
+    urllib.error.URLError,
+    ConnectionError,          # ConnectionResetError и т.п.
+    http.client.HTTPException,  # IncompleteRead и т.п.
+    ssl.SSLError,
+    RetryableError,
+)
 
 
 def log_problem(problem, path=None, url=None, details=None):
@@ -50,7 +69,6 @@ def calculate_md5(file_path, chunk_size=8192):
     """Вычисляет MD5-хеш локального файла."""
     if not os.path.exists(file_path):
         return None
-
     hasher = hashlib.md5()
     try:
         with open(file_path, "rb") as f:
@@ -92,12 +110,11 @@ def fetch_with_retry(url, timeout=30, retries=8, backoff=5):
             wait = (backoff * attempt) + random.uniform(1, 3)
             print(f"  ошибка HTTP ({e.code} {e.reason}), повтор {attempt}/{retries} через {wait:.1f}с...")
             time.sleep(wait)
-        except (TimeoutError, socket.timeout, urllib.error.URLError) as e:
+        except RETRY_ERRORS as e:
             last_err = e
             wait = (backoff * attempt) + random.uniform(1, 3)
             print(f"  сетевая ошибка ({e}), повтор {attempt}/{retries} через {wait:.1f}с...")
             time.sleep(wait)
-
     if last_err:
         raise last_err
     raise Exception("Не удалось выполнить HTTP-запрос")
@@ -125,23 +142,28 @@ def get_download_url(public_key, path):
 
 
 def download_file(public_key, item_path, dest_path, expected_size=None, expected_md5=None):
-    """Скачивает файл с докачкой, проверкой MD5 и ограничением попыток для 500/4xx."""
+    """
+    Скачивает файл с докачкой и проверкой размера и MD5.
+    Возвращает:
+      "success" - файл скачан и проверен
+      "gone"    - сервер сообщил, что файла нет (400/404/410); кэшируется
+      "failed"  - не удалось (сеть, диск, проверка); не кэшируется, повторится при следующем запуске
+    """
     max_retries = 5
     last_error = None
     last_url = None
 
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+
     for attempt in range(1, max_retries + 1):
         try:
-            os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-
             # Проверка уже готового файла по размеру и MD5
             if os.path.exists(dest_path):
                 file_size = os.path.getsize(dest_path)
                 if expected_size is not None and file_size == expected_size:
                     if not expected_md5:
                         return "success"
-                    actual_md5 = calculate_md5(dest_path)
-                    if actual_md5 == expected_md5:
+                    if calculate_md5(dest_path) == expected_md5:
                         return "success"
 
             dl_url = get_download_url(public_key, item_path)
@@ -156,6 +178,8 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
                 if 0 < existing_size < expected_size:
                     headers["Range"] = f"bytes={existing_size}-"
                     mode = "ab"
+                else:
+                    existing_size = 0
 
             req = urllib.request.Request(dl_url, headers=headers)
 
@@ -163,7 +187,7 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
                 r = urllib.request.urlopen(req, timeout=60)
                 status = r.status
             except urllib.error.HTTPError as e:
-                if e.code == 416:  # Range не сошелся
+                if e.code == 416:  # Range не сошёлся
                     existing_size = 0
                     mode = "wb"
                     dl_url = get_download_url(public_key, item_path)
@@ -174,6 +198,7 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
                 else:
                     raise
 
+            # Сервер проигнорировал Range и отдаёт файл целиком
             if status == 200 and mode == "ab":
                 existing_size = 0
                 mode = "wb"
@@ -186,7 +211,6 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
                     chunk = r.read(1024 * 256)
                     if not chunk:
                         break
-
                     f.write(chunk)
                     downloaded += len(chunk)
                     if total:
@@ -198,15 +222,19 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
             # Проверка итогового размера
             actual_size = os.path.getsize(dest_path)
             if expected_size is not None and actual_size != expected_size:
-                raise Exception(f"Размер файла не совпадает: ожидался {expected_size}, получен {actual_size}")
+                if actual_size > expected_size:
+                    os.remove(dest_path)  # битый хвост, докачка не поможет
+                # если меньше - файл остаётся, следующая попытка докачает через Range
+                raise RetryableError(
+                    f"Размер не совпадает: ожидался {expected_size}, получен {actual_size}")
 
-            # Финальная проверка MD5 после скачивания
+            # Финальная проверка MD5
             if expected_md5:
                 actual_md5 = calculate_md5(dest_path)
-                if actual_md5 is None:
-                    raise Exception("Не удалось вычислить MD5 скачанного файла")
                 if actual_md5 != expected_md5:
-                    raise Exception(f"MD5 не совпадает: ожидался {expected_md5}, получен {actual_md5}")
+                    os.remove(dest_path)  # докачка битого файла бессмысленна
+                    raise RetryableError(
+                        f"MD5 не совпадает: ожидался {expected_md5}, получен {actual_md5}")
 
             return "success"
 
@@ -222,16 +250,15 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
             if attempt < max_retries:
                 time.sleep(wait)
 
-        except (TimeoutError, socket.timeout, urllib.error.URLError) as e:
+        except RETRY_ERRORS as e:
             last_error = e
             wait = 5 * attempt + random.uniform(1.0, 3.0)
-            print(f"\n  сетевая ошибка ({e}), попытка {attempt}/{max_retries} через {wait:.1f}с...")
+            print(f"\n  ошибка ({e}), попытка {attempt}/{max_retries} через {wait:.1f}с...")
             if attempt < max_retries:
                 time.sleep(wait)
 
         except Exception as e:
-            # Локальные ошибки диска, записи, проверки и прочие ошибки
-            last_error = e
+            # Локальные ошибки диска, записи и прочее: повторять бессмысленно
             print(f"\n  ОШИБКА: {e}")
             log_problem("Ошибка скачивания или проверки файла", item_path, last_url, e)
             return "failed"
@@ -244,7 +271,7 @@ def download_file(public_key, item_path, dest_path, expected_size=None, expected
 def list_all(public_key, path="/", counter=None):
     """Рекурсивно получает все файлы с пагинацией."""
     if counter is None:
-        counter = [0]
+        counter = [0]  # изменяемый объект: общий счётчик для всех уровней рекурсии
 
     offset = 0
     limit = 100
@@ -265,7 +292,7 @@ def list_all(public_key, path="/", counter=None):
                 files.extend(list_all(public_key, item["path"], counter))
 
         offset += len(items)
-        if offset >= total:
+        if offset >= total or not items:
             break
     return files
 
@@ -280,7 +307,7 @@ def load_cached_files(public_key):
             cache_data = json.load(f)
 
         if time.time() - cache_data.get("timestamp", 0) < CACHE_TTL:
-            print(f"Использую закэшированный список файлов для этой ссылки...")
+            print("Использую закэшированный список файлов для этой ссылки...")
             return cache_data.get("files")
     except Exception as e:
         print(f"Ошибка чтения кэша: {e}")
@@ -307,8 +334,7 @@ def get_single_resource_meta(public_key):
     """Получает метаданные для одиночного файла по публичной ссылке."""
     params = urllib.parse.urlencode({"public_key": public_key})
     url = f"{API}?{params}"
-    data = json.loads(fetch_with_retry(url, timeout=30))
-    return data
+    return json.loads(fetch_with_retry(url, timeout=30))
 
 
 def main():
@@ -321,7 +347,7 @@ def main():
 
     print(f"Журнал ошибок: {os.path.abspath(unavailable_log)}")
 
-    # 1. Проверяем, папка это или одиночный файл через метаданные
+    # 1. Папка это или одиночный файл
     try:
         meta = get_single_resource_meta(public_key)
     except Exception as e:
@@ -329,7 +355,7 @@ def main():
         log_problem("Не удалось получить метаданные ресурса", url=public_key, details=e)
         sys.exit(1)
 
-    # Если это одиночный файл (type == "file")
+    # Одиночный файл
     if meta.get("type") == "file":
         file_name = meta.get("name", "file")
         dest_path = os.path.join(dest_dir, file_name)
@@ -344,22 +370,22 @@ def main():
             print("\nГотово! Файл успешно скачан.")
         else:
             print(f"\nНе удалось скачать файл. Результат: {result}")
+            sys.exit(1)
         return
 
-    # 2. Если это папка — работаем через кэш и список файлов
+    # 2. Папка: кэш и список файлов
     files = load_cached_files(public_key)
 
     if files is None:
-        print(f"Получаю список файлов с Яндекс Диска ...")
+        print("Получаю список файлов с Яндекс Диска ...")
         try:
             files = list_all(public_key)
             print(f"\r  Получено файлов: {len(files)}")
-            # Добавим поле status="active" для каждого файла по умолчанию
             for f in files:
                 f.setdefault("status", "active")
             save_cached_files(public_key, files)
         except Exception as e:
-            print(f"Ошибка получения списка файлов: {e}")
+            print(f"\nОшибка получения списка файлов: {e}")
             log_problem("Не удалось получить список файлов", url=public_key, details=e)
             sys.exit(1)
 
@@ -371,42 +397,50 @@ def main():
     print(f"Найдено файлов: {len(files)}, общий размер: {total_size/1024/1024:.1f} МБ\n")
 
     cache_updated = False
+    stats = {"success": 0, "skipped": 0, "failed": 0, "gone": 0}
 
     # 3. Скачивание файлов
     for i, item in enumerate(files, 1):
-        # Если файл ранее получил статус gone, пропускаем его, не тратя запросы
+        rel_path = item["path"].lstrip("/")
+
+        # Ранее помеченные как gone пропускаем, не тратя запросы
         if item.get("status") == "gone":
-            print(f"[{i}/{len(files)}] {item['path'].lstrip('/')} — пропущен (статус gone в кэше)")
-            log_problem("Файл пропущен: ранее помечен как недоступный", item["path"])
+            print(f"[{i}/{len(files)}] {rel_path} — пропущен (статус gone в кэше)")
+            stats["gone"] += 1
             continue
 
-        rel_path = item["path"].lstrip("/")
         dest_path = os.path.join(dest_dir, rel_path)
         expected_size = item.get("size", -1)
         expected_md5 = item.get("md5")
 
-        # Значение -1 означает, что размер неизвестен
-        if expected_size < 0:
+        # -1 означает, что размер неизвестен
+        if expected_size is not None and expected_size < 0:
             expected_size = None
 
         print(f"[{i}/{len(files)}] {rel_path}")
 
-        # Проверка целостности уже скачанного файла (размер + MD5)
+        # Проверка уже скачанного файла (размер + MD5)
         if os.path.exists(dest_path):
             if expected_size is not None and os.path.getsize(dest_path) == expected_size:
                 if not expected_md5:
                     print("  пропускаю (размер совпадает)")
+                    stats["skipped"] += 1
                     continue
                 if calculate_md5(dest_path) == expected_md5:
                     print("  пропускаю (уже скачан и проверен)")
+                    stats["skipped"] += 1
                     continue
 
-        # Попытка скачивания
         status = download_file(public_key, item["path"], dest_path, expected_size, expected_md5)
 
         if status == "gone":
             item["status"] = "gone"
             cache_updated = True
+            stats["gone"] += 1
+        elif status == "failed":
+            stats["failed"] += 1
+        else:
+            stats["success"] += 1
 
         time.sleep(random.uniform(2.0, 4.0))
 
@@ -415,7 +449,12 @@ def main():
         save_cached_files(public_key, files)
 
     print(f"\nГотово! Файлы сохранены в: {os.path.abspath(dest_dir)}")
+    print(f"Скачано: {stats['success']} | пропущено: {stats['skipped']} | "
+          f"gone: {stats['gone']} | ошибок: {stats['failed']}")
     print(f"Журнал ошибок: {os.path.abspath(unavailable_log)}")
+
+    if stats["failed"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
